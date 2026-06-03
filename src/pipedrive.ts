@@ -115,19 +115,24 @@ export class PipedriveClient {
     if (options.filter_by === "updated") {
       params.updated_since = `${options.start_date}T00:00:00Z`;
       params.updated_until = `${options.end_date}T23:59:59Z`;
+    } else {
+      // Sort descending so newest deals appear first — important when hitting the cap
+      params.sort_by = "add_time";
+      params.sort_direction = "desc";
     }
 
     const { items: raw, truncated } = await this.fetchCursor<Record<string, unknown>>(
       "/deals/collection",
       params,
-      options.filter_by === "created" ? MAX_ITEMS_CAP : maxItems
+      MAX_ITEMS_CAP
     );
 
     let deals = raw.map(toDeal);
 
     if (options.filter_by === "created") {
-      const from = `${options.start_date}T00:00:00`;
-      const to = `${options.end_date}T23:59:59`;
+      // Pipedrive add_time format: "YYYY-MM-DD HH:MM:SS" (space separator, not T)
+      const from = `${options.start_date} 00:00:00`;
+      const to = `${options.end_date} 23:59:59`;
       deals = deals.filter((d) => d.add_time >= from && d.add_time <= to);
     }
 
