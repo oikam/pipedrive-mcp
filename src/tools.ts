@@ -147,22 +147,24 @@ export function registerTools(server: McpServer, client: PipedriveClient): void 
     "pipedrive_list_organizations",
     {
       title: "List Organizations",
-      description: "List organizations with optional date range filter (by last update). Returns standard and custom fields with resolved option labels.",
+      description: "List organizations with optional date range filter (by last update time, client-side filtered). Returns standard and custom fields with resolved option labels. Use after_id to page beyond 5000 results.",
       inputSchema: z.object({
-        start_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe("Filter updated since this date (YYYY-MM-DD)"),
-        end_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe("Filter updated until this date (YYYY-MM-DD)"),
+        start_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe("Filter updated since this date (YYYY-MM-DD, inclusive)"),
+        end_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe("Filter updated until this date (YYYY-MM-DD, inclusive)"),
         owner_id: z.number().int().positive().optional().describe("Filter by owner user ID"),
-        limit: z.number().int().min(1).max(2000).default(100).describe("Max organizations to return (auto-paginates)"),
+        limit: z.number().int().min(1).max(5000).default(100).describe("Max organizations to return (auto-paginates up to 5000)"),
+        after_id: z.number().int().positive().optional().describe("Return orgs with ID after this value — use for paging beyond the limit"),
       }),
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async ({ start_date, end_date, owner_id, limit }) => {
+    async ({ start_date, end_date, owner_id, limit, after_id }) => {
       try {
         const { items: orgs, truncated } = await client.listOrganizations({
           updated_since: start_date ? `${start_date}T00:00:00Z` : undefined,
           updated_until: end_date ? `${end_date}T23:59:59Z` : undefined,
           owner_id,
           limit,
+          after_id,
         });
 
         const truncatedNote = truncated ? `\n\n⚠️ Results capped at ${limit}.` : "";
@@ -377,12 +379,22 @@ function stripHtml(html: string): string {
 }
 
 function fieldsResponse(fields: PipedriveField[]) {
+  // Show all fields but keep text compact: key, name, type, options only
   const lines = fields.map((f) => {
-    const opts = f.options?.length ? ` | options: ${f.options.map((o) => `${o.label}(${o.id})`).join(", ")}` : "";
-    return `• [${f.key}] ${f.name} (${f.field_type})${opts}`;
+    const opts = (f.field_type === "enum" || f.field_type === "set") && f.options?.length
+      ? ` [${f.options.map((o) => `${o.label}=${o.id}`).join(", ")}]`
+      : "";
+    return `${f.key} | ${f.name} | ${f.field_type}${opts}`;
   });
+  // Slim structured output — only essential fields
+  const slim = fields.map((f) => ({
+    key: f.key,
+    name: f.name,
+    field_type: f.field_type,
+    ...(f.options?.length ? { options: f.options } : {}),
+  }));
   return {
     content: [{ type: "text" as const, text: `${fields.length} field(s):\n\n${lines.join("\n")}` }],
-    structuredContent: { fields },
+    structuredContent: { fields: slim },
   };
 }

@@ -1,6 +1,7 @@
 import axios, { AxiosError, AxiosInstance } from "axios";
 
-const MAX_ITEMS_CAP = 2000;
+const MAX_ITEMS_CAP = 5000;
+const CUSTOM_FIELD_KEY = /^[0-9a-f]{40}$/;
 
 export interface Pipeline {
   id: number;
@@ -21,8 +22,10 @@ export interface Deal {
   value: number | null;
   currency: string;
   owner_name: string | null;
+  org_id: number | null;
   org_name: string | null;
   won_time: string | null;
+  custom_fields: Record<string, unknown>;
 }
 
 export interface FieldOption {
@@ -35,6 +38,7 @@ export interface PipedriveField {
   name: string;
   field_type: string;
   mandatory_flag: boolean;
+  edit_flag: boolean;
   options?: FieldOption[];
 }
 
@@ -200,14 +204,66 @@ export class PipedriveClient {
     updated_until?: string;
     owner_id?: number;
     limit?: number;
+    after_id?: number;
   }): Promise<PagedResult<Organization>> {
     const maxItems = Math.min(options.limit ?? 100, MAX_ITEMS_CAP);
+
+    // Date filter: /organizations/collection ignores updated_since/until (Pipedrive bug).
+    // Use /organizations offset endpoint with sort=update_time DESC + client-side filter.
+    if (options.updated_since || options.updated_until) {
+      const from = options.updated_since
+        ? options.updated_since.replace("T", " ").replace("Z", "")
+        : "0000-01-01 00:00:00";
+      const to = options.updated_until
+        ? options.updated_until.replace("T", " ").replace("Z", "")
+        : "9999-12-31 23:59:59";
+      return this.fetchOrgsByUpdatedDate(from, to, maxItems, options.owner_id);
+    }
+
+    // No date filter: fast cursor-based fetch
     const params: Record<string, unknown> = { include_option_labels: true };
-    if (options.updated_since) params.updated_since = options.updated_since;
-    if (options.updated_until) params.updated_until = options.updated_until;
     if (options.owner_id) params.owner_id = options.owner_id;
+    if (options.after_id) params.since_id = options.after_id;
 
     return this.fetchCursor<Organization>("/organizations/collection", params, maxItems);
+  }
+
+  private async fetchOrgsByUpdatedDate(
+    from: string,
+    to: string,
+    maxItems: number,
+    owner_id?: number
+  ): Promise<PagedResult<Organization>> {
+    const orgs: Organization[] = [];
+    let start = 0;
+
+    while (true) {
+      const params: Record<string, unknown> = {
+        sort: "update_time DESC",
+        include_option_labels: true,
+        start,
+        limit: 500,
+      };
+      if (owner_id) params.owner_id = owner_id;
+
+      const res = await this.get<OffsetResponse<Organization>>("/organizations", params);
+      const page = res.data ?? [];
+
+      for (const org of page) {
+        const ut = (org.update_time as string) ?? "";
+        if (ut < from) return { items: orgs, truncated: false };
+        if (ut <= to) {
+          orgs.push(org);
+          if (orgs.length >= maxItems) return { items: orgs, truncated: true };
+        }
+      }
+
+      const more = res.additional_data?.pagination?.more_items_in_collection ?? false;
+      if (!more || page.length === 0) break;
+      start += 500;
+    }
+
+    return { items: orgs, truncated: false };
   }
 
   // ── Persons ──────────────────────────────────────────────────────────────
@@ -462,9 +518,23 @@ export class PipedriveClient {
   }
 }
 
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+// Pipedrive sometimes returns relation fields as { value: id, ...} objects
+function extractId(v: unknown): number | null {
+  if (v == null) return null;
+  if (typeof v === "number") return v;
+  if (typeof v === "object" && v !== null && "value" in v) return (v as { value: number }).value ?? null;
+  return null;
+}
+
 // ── Mappers ──────────────────────────────────────────────────────────────────
 
 function toDeal(d: Record<string, unknown>): Deal {
+  const custom_fields: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(d)) {
+    if (CUSTOM_FIELD_KEY.test(k) && v != null) custom_fields[k] = v;
+  }
   return {
     id: d.id as number,
     title: d.title as string,
@@ -476,8 +546,10 @@ function toDeal(d: Record<string, unknown>): Deal {
     value: (d.value as number | null) ?? null,
     currency: d.currency as string,
     owner_name: (d.owner_name as string | null) ?? null,
+    org_id: extractId(d.org_id),
     org_name: (d.org_name as string | null) ?? null,
     won_time: (d.won_time as string | null) ?? null,
+    custom_fields,
   };
 }
 
