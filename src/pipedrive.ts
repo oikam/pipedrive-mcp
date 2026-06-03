@@ -115,29 +115,20 @@ export class PipedriveClient {
     if (options.filter_by === "updated") {
       params.updated_since = `${options.start_date}T00:00:00Z`;
       params.updated_until = `${options.end_date}T23:59:59Z`;
-    } else {
-      // Sort descending so newest deals appear first — important when hitting the cap
-      params.sort_by = "add_time";
-      params.sort_direction = "desc";
+      const { items: raw, truncated } = await this.fetchCursor<Record<string, unknown>>(
+        "/deals/collection",
+        params,
+        maxItems
+      );
+      return { items: raw.map(toDeal), truncated };
     }
 
-    const { items: raw, truncated } = await this.fetchCursor<Record<string, unknown>>(
-      "/deals/collection",
-      params,
-      MAX_ITEMS_CAP
-    );
-
-    let deals = raw.map(toDeal);
-
-    if (options.filter_by === "created") {
-      // Pipedrive add_time format: "YYYY-MM-DD HH:MM:SS" (space separator, not T)
-      const from = `${options.start_date} 00:00:00`;
-      const to = `${options.end_date} 23:59:59`;
-      deals = deals.filter((d) => d.add_time >= from && d.add_time <= to);
-    }
-
-    const wasTruncated = truncated || deals.length > maxItems;
-    return { items: deals.slice(0, maxItems), truncated: wasTruncated };
+    // filter_by === "created": use /deals with sort_by=add_time desc + early exit
+    // Pipedrive add_time format: "YYYY-MM-DD HH:MM:SS" (space separator)
+    const from = `${options.start_date} 00:00:00`;
+    const to = `${options.end_date} 23:59:59`;
+    const deals = await this.fetchDealsByCreatedDate(params, from, to, maxItems);
+    return deals;
   }
 
   // ── Field definitions ────────────────────────────────────────────────────
@@ -188,6 +179,51 @@ export class PipedriveClient {
     if (options.owner_id) params.owner_id = options.owner_id;
 
     return this.fetchCursor<Person>("/persons/collection", params, maxItems);
+  }
+
+  // ── Deals by created date (offset pagination + early exit) ──────────────
+
+  private async fetchDealsByCreatedDate(
+    baseParams: Record<string, unknown>,
+    from: string,
+    to: string,
+    maxItems: number
+  ): Promise<PagedResult<Deal>> {
+    const deals: Deal[] = [];
+    let start = 0;
+    let truncated = false;
+
+    while (true) {
+      const params: Record<string, unknown> = {
+        ...baseParams,
+        sort: "add_time DESC",
+        start,
+        limit: 500,
+      };
+
+      const res = await this.get<OffsetResponse<Record<string, unknown>>>("/deals", params);
+      const page = res.data ?? [];
+
+      for (const raw of page) {
+        const addTime = raw.add_time as string;
+        // Since sorted desc, once we're before the range we can stop entirely
+        if (addTime < from) {
+          return { items: deals, truncated };
+        }
+        if (addTime <= to) {
+          deals.push(toDeal(raw));
+          if (deals.length >= maxItems) {
+            return { items: deals, truncated: true };
+          }
+        }
+      }
+
+      const more = res.additional_data?.pagination?.more_items_in_collection ?? false;
+      if (!more || page.length === 0) break;
+      start += 500;
+    }
+
+    return { items: deals, truncated };
   }
 
   // ── Pagination helpers ───────────────────────────────────────────────────
