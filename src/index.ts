@@ -10,6 +10,12 @@ if (!apiToken) {
   process.exit(1);
 }
 
+const mcpAuthToken = process.env.MCP_AUTH_TOKEN;
+if (!mcpAuthToken) {
+  console.error("Error: MCP_AUTH_TOKEN environment variable is required.");
+  process.exit(1);
+}
+
 const client = new PipedriveClient(apiToken);
 
 function createServer(): McpServer {
@@ -26,6 +32,12 @@ app.get("/health", (_req, res) => {
 });
 
 app.post("/mcp", async (req, res) => {
+  const authHeader = req.headers["authorization"];
+  if (!authHeader || authHeader !== `Bearer ${mcpAuthToken}`) {
+    res.status(401).json({ error: "Unauthorized" });
+    return;
+  }
+
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
     enableJsonResponse: true,
