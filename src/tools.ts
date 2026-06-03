@@ -1,6 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { PipedriveClient, PipedriveField } from "./pipedrive.js";
+import { PipedriveClient, PipedriveField, Note } from "./pipedrive.js";
 
 export function registerTools(server: McpServer, client: PipedriveClient): void {
 
@@ -215,12 +215,160 @@ export function registerTools(server: McpServer, client: PipedriveClient): void 
       }
     }
   );
+
+  // ── Activity types ─────────────────────────────────────────────────────────
+
+  server.registerTool(
+    "pipedrive_list_activity_types",
+    {
+      title: "List Activity Types",
+      description: "List all activity types (call, meeting, email, task, etc.) with their IDs and key strings. Use this before pipedrive_list_activities to know valid type values.",
+      inputSchema: z.object({}),
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async () => {
+      try {
+        const types = await client.getActivityTypes();
+        const lines = types.map((t) => `• [${t.id}] ${t.name} (key: ${t.key_string})`).join("\n");
+        return {
+          content: [{ type: "text" as const, text: `${types.length} activity type(s):\n\n${lines}` }],
+          structuredContent: { activity_types: types },
+        };
+      } catch (err) {
+        return { content: [{ type: "text" as const, text: `Error: ${errMsg(err)}` }] };
+      }
+    }
+  );
+
+  // ── Activities ─────────────────────────────────────────────────────────────
+
+  server.registerTool(
+    "pipedrive_list_activities",
+    {
+      title: "List Activities",
+      description: "List activities with optional filters. Filters by last update date if dates provided. Can filter by deal, person, org, owner, or completion status.",
+      inputSchema: z.object({
+        updated_since: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe("Filter activities updated since this date (YYYY-MM-DD)"),
+        updated_until: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe("Filter activities updated until this date (YYYY-MM-DD)"),
+        deal_id: z.number().int().positive().optional().describe("Filter by deal ID"),
+        person_id: z.number().int().positive().optional().describe("Filter by person ID"),
+        org_id: z.number().int().positive().optional().describe("Filter by organization ID"),
+        owner_id: z.number().int().positive().optional().describe("Filter by owner user ID"),
+        done: z.boolean().optional().describe("Filter by completion: true = done, false = open, omit = all"),
+        limit: z.number().int().min(1).max(2000).default(100).describe("Max activities to return (auto-paginates)"),
+      }),
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ updated_since, updated_until, deal_id, person_id, org_id, owner_id, done, limit }) => {
+      try {
+        const { items: activities, truncated } = await client.listActivities({
+          updated_since: updated_since ? `${updated_since}T00:00:00Z` : undefined,
+          updated_until: updated_until ? `${updated_until}T23:59:59Z` : undefined,
+          deal_id, person_id, org_id, owner_id, done, limit,
+        });
+
+        if (activities.length === 0) {
+          return { content: [{ type: "text" as const, text: "No activities found matching the given filters." }] };
+        }
+
+        const lines = activities.map((a) =>
+          `• [${a.id}] ${a.subject} | type: ${a.type} | done: ${a.done ? "✓" : "○"} | due: ${a.due_date ?? "—"} ${a.due_time ?? ""} | owner: ${a.owner_name ?? "—"} | deal: ${a.deal_title ?? "—"}${a.note ? ` | note: ${a.note.slice(0, 80)}${a.note.length > 80 ? "…" : ""}` : ""}`
+        ).join("\n");
+
+        const truncatedNote = truncated ? `\n\n⚠️ Results capped at ${limit}. Narrow filters to get all activities.` : "";
+
+        return {
+          content: [{ type: "text" as const, text: `Found ${activities.length} activity/activities:\n\n${lines}${truncatedNote}` }],
+          structuredContent: { activities, total: activities.length, truncated },
+        };
+      } catch (err) {
+        return { content: [{ type: "text" as const, text: `Error: ${errMsg(err)}` }] };
+      }
+    }
+  );
+
+  // ── Notes ──────────────────────────────────────────────────────────────────
+
+  server.registerTool(
+    "pipedrive_list_notes",
+    {
+      title: "List Notes",
+      description: "List notes with optional filters by date range or association (deal, person, org). Note content is truncated to 500 chars — use pipedrive_get_note for the full text of a specific note.",
+      inputSchema: z.object({
+        start_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe("Filter notes added from this date (YYYY-MM-DD)"),
+        end_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe("Filter notes added until this date (YYYY-MM-DD)"),
+        deal_id: z.number().int().positive().optional().describe("Filter by deal ID"),
+        person_id: z.number().int().positive().optional().describe("Filter by person ID"),
+        org_id: z.number().int().positive().optional().describe("Filter by organization ID"),
+        user_id: z.number().int().positive().optional().describe("Filter by note author user ID"),
+        pinned_to_deal: z.boolean().optional().describe("Filter by pinned-to-deal status"),
+        limit: z.number().int().min(1).max(2000).default(100).describe("Max notes to return (auto-paginates)"),
+      }),
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ start_date, end_date, deal_id, person_id, org_id, user_id, pinned_to_deal, limit }) => {
+      try {
+        const { items: notes, truncated } = await client.listNotes({
+          start_date, end_date, deal_id, person_id, org_id, user_id, pinned_to_deal, limit,
+        });
+
+        if (notes.length === 0) {
+          return { content: [{ type: "text" as const, text: "No notes found matching the given filters." }] };
+        }
+
+        const lines = notes.map((n) => {
+          const plain = stripHtml(n.content);
+          const preview = plain.length > 500 ? `${plain.slice(0, 500)}… [use pipedrive_get_note id=${n.id} for full text]` : plain;
+          const pins = [n.pinned_to_deal_flag && "deal", n.pinned_to_person_flag && "person", n.pinned_to_org_flag && "org"].filter(Boolean).join(", ");
+          return `• [${n.id}] ${n.add_time.slice(0, 10)} | deal: ${n.deal_id ?? "—"} | person: ${n.person_id ?? "—"} | org: ${n.org_id ?? "—"}${pins ? ` | pinned: ${pins}` : ""}\n  ${preview}`;
+        }).join("\n\n");
+
+        const truncatedNote = truncated ? `\n\n⚠️ Results capped at ${limit}.` : "";
+
+        return {
+          content: [{ type: "text" as const, text: `Found ${notes.length} note(s):\n\n${lines}${truncatedNote}` }],
+          structuredContent: { notes: notes.map((n) => ({ ...n, content_plain: stripHtml(n.content) })), total: notes.length, truncated },
+        };
+      } catch (err) {
+        return { content: [{ type: "text" as const, text: `Error: ${errMsg(err)}` }] };
+      }
+    }
+  );
+
+  server.registerTool(
+    "pipedrive_get_note",
+    {
+      title: "Get Note Detail",
+      description: "Retrieve full content and metadata of a single note by ID. Use when pipedrive_list_notes truncated a note's content.",
+      inputSchema: z.object({
+        note_id: z.number().int().positive().describe("Note ID to retrieve"),
+      }),
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ note_id }) => {
+      try {
+        const note = await client.getNote(note_id);
+        const plain = stripHtml(note.content);
+        const pins = [note.pinned_to_deal_flag && "deal", note.pinned_to_person_flag && "person", note.pinned_to_org_flag && "org"].filter(Boolean).join(", ");
+        return {
+          content: [{ type: "text" as const, text: `Note [${note.id}] — ${note.add_time.slice(0, 10)}\nDeal: ${note.deal_id ?? "—"} | Person: ${note.person_id ?? "—"} | Org: ${note.org_id ?? "—"}${pins ? ` | Pinned: ${pins}` : ""}\n\n${plain}` }],
+          structuredContent: { note: { ...note, content_plain: plain } },
+        };
+      } catch (err) {
+        return { content: [{ type: "text" as const, text: `Error: ${errMsg(err)}` }] };
+      }
+    }
+  );
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ── Helpers ──────────────────────────────────────────────────────────────────
 
 function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+function stripHtml(html: string): string {
+  return html.replace(/<[^>]*>/g, "").replace(/&nbsp;/g, " ").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").trim();
 }
 
 function fieldsResponse(fields: PipedriveField[]) {

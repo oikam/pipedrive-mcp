@@ -77,6 +77,46 @@ export interface PagedResult<T> {
   truncated: boolean;
 }
 
+export interface ActivityType {
+  id: number;
+  name: string;
+  key_string: string;
+  icon_key: string;
+  color: string | null;
+}
+
+export interface Activity {
+  id: number;
+  subject: string;
+  type: string;
+  done: boolean;
+  due_date: string | null;
+  due_time: string | null;
+  duration: string | null;
+  add_time: string;
+  update_time: string;
+  note: string | null;
+  deal_id: number | null;
+  person_id: number | null;
+  org_id: number | null;
+  owner_name: string | null;
+  deal_title: string | null;
+}
+
+export interface Note {
+  id: number;
+  content: string;
+  add_time: string;
+  update_time: string;
+  user_id: number | null;
+  deal_id: number | null;
+  person_id: number | null;
+  org_id: number | null;
+  pinned_to_deal_flag: boolean;
+  pinned_to_person_flag: boolean;
+  pinned_to_org_flag: boolean;
+}
+
 export class PipedriveClient {
   private http: AxiosInstance;
 
@@ -181,6 +221,74 @@ export class PipedriveClient {
     return this.fetchCursor<Person>("/persons/collection", params, maxItems);
   }
 
+  // ── Activity types ───────────────────────────────────────────────────────
+
+  async getActivityTypes(): Promise<ActivityType[]> {
+    const res = await this.get<{ success: boolean; data: ActivityType[] | null }>("/activityTypes");
+    return res.data ?? [];
+  }
+
+  // ── Activities ───────────────────────────────────────────────────────────
+
+  async listActivities(options: {
+    updated_since?: string;
+    updated_until?: string;
+    owner_id?: number;
+    deal_id?: number;
+    person_id?: number;
+    org_id?: number;
+    done?: boolean;
+    limit?: number;
+  }): Promise<PagedResult<Activity>> {
+    const maxItems = Math.min(options.limit ?? 100, MAX_ITEMS_CAP);
+    const params: Record<string, unknown> = {};
+    if (options.updated_since) params.updated_since = options.updated_since;
+    if (options.updated_until) params.updated_until = options.updated_until;
+    if (options.owner_id != null) params.owner_id = options.owner_id;
+    if (options.deal_id != null) params.deal_id = options.deal_id;
+    if (options.person_id != null) params.person_id = options.person_id;
+    if (options.org_id != null) params.org_id = options.org_id;
+    if (options.done != null) params.done = options.done ? 1 : 0;
+
+    const { items: raw, truncated } = await this.fetchCursor<Record<string, unknown>>(
+      "/activities/collection",
+      params,
+      maxItems
+    );
+    return { items: raw.map(toActivity), truncated };
+  }
+
+  // ── Notes ────────────────────────────────────────────────────────────────
+
+  async listNotes(options: {
+    start_date?: string;
+    end_date?: string;
+    deal_id?: number;
+    person_id?: number;
+    org_id?: number;
+    user_id?: number;
+    pinned_to_deal?: boolean;
+    limit?: number;
+  }): Promise<PagedResult<Note>> {
+    const maxItems = Math.min(options.limit ?? 100, MAX_ITEMS_CAP);
+    const params: Record<string, unknown> = {};
+    if (options.start_date) params.start_date = options.start_date;
+    if (options.end_date) params.end_date = options.end_date;
+    if (options.deal_id != null) params.deal_id = options.deal_id;
+    if (options.person_id != null) params.person_id = options.person_id;
+    if (options.org_id != null) params.org_id = options.org_id;
+    if (options.user_id != null) params.user_id = options.user_id;
+    if (options.pinned_to_deal != null) params.pinned_to_deal_flag = options.pinned_to_deal ? 1 : 0;
+
+    const items = await this.fetchOffsetWithParams<Record<string, unknown>>("/notes", params, maxItems);
+    return { items: items.items.map(toNote), truncated: items.truncated };
+  }
+
+  async getNote(id: number): Promise<Note> {
+    const res = await this.get<{ success: boolean; data: Record<string, unknown> }>(`/notes/${id}`);
+    return toNote(res.data);
+  }
+
   // ── Deals by created date (offset pagination + early exit) ──────────────
 
   private async fetchDealsByCreatedDate(
@@ -270,6 +378,29 @@ export class PipedriveClient {
     return items;
   }
 
+  private async fetchOffsetWithParams<T>(
+    endpoint: string,
+    params: Record<string, unknown>,
+    maxItems: number
+  ): Promise<PagedResult<T>> {
+    const items: T[] = [];
+    let start = 0;
+    let more = true;
+
+    while (more && items.length < maxItems) {
+      const res = await this.get<OffsetResponse<T>>(endpoint, {
+        ...params,
+        start,
+        limit: Math.min(500, maxItems - items.length),
+      });
+      if (res.data) items.push(...res.data);
+      more = res.additional_data?.pagination?.more_items_in_collection ?? false;
+      start += 500;
+    }
+
+    return { items: items.slice(0, maxItems), truncated: more };
+  }
+
   private async get<T>(endpoint: string, params?: Record<string, unknown>): Promise<T> {
     try {
       const res = await this.http.get<T>(endpoint, { params });
@@ -295,6 +426,42 @@ function toDeal(d: Record<string, unknown>): Deal {
     currency: d.currency as string,
     owner_name: (d.owner_name as string | null) ?? null,
     org_name: (d.org_name as string | null) ?? null,
+  };
+}
+
+function toActivity(d: Record<string, unknown>): Activity {
+  return {
+    id: d.id as number,
+    subject: (d.subject as string) ?? "",
+    type: (d.type as string) ?? "",
+    done: Boolean(d.done),
+    due_date: (d.due_date as string | null) ?? null,
+    due_time: (d.due_time as string | null) ?? null,
+    duration: (d.duration as string | null) ?? null,
+    add_time: d.add_time as string,
+    update_time: d.update_time as string,
+    note: (d.note as string | null) ?? null,
+    deal_id: (d.deal_id as number | null) ?? null,
+    person_id: (d.person_id as number | null) ?? null,
+    org_id: (d.org_id as number | null) ?? null,
+    owner_name: (d.owner_name as string | null) ?? null,
+    deal_title: (d.deal_title as string | null) ?? null,
+  };
+}
+
+function toNote(d: Record<string, unknown>): Note {
+  return {
+    id: d.id as number,
+    content: (d.content as string) ?? "",
+    add_time: d.add_time as string,
+    update_time: d.update_time as string,
+    user_id: (d.user_id as number | null) ?? null,
+    deal_id: (d.deal_id as number | null) ?? null,
+    person_id: (d.person_id as number | null) ?? null,
+    org_id: (d.org_id as number | null) ?? null,
+    pinned_to_deal_flag: Boolean(d.pinned_to_deal_flag),
+    pinned_to_person_flag: Boolean(d.pinned_to_person_flag),
+    pinned_to_org_flag: Boolean(d.pinned_to_org_flag),
   };
 }
 
