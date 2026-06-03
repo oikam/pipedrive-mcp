@@ -22,6 +22,7 @@ export interface Deal {
   currency: string;
   owner_name: string | null;
   org_name: string | null;
+  won_time: string | null;
 }
 
 export interface FieldOption {
@@ -141,7 +142,7 @@ export class PipedriveClient {
     pipeline_id: number;
     start_date: string;
     end_date: string;
-    filter_by: "created" | "updated";
+    filter_by: "created" | "updated" | "won";
     status?: string;
     limit?: number;
   }): Promise<PagedResult<Deal>> {
@@ -163,12 +164,19 @@ export class PipedriveClient {
       return { items: raw.map(toDeal), truncated };
     }
 
-    // filter_by === "created": use /deals with sort_by=add_time desc + early exit
+    // filter_by === "won": sort by update_time desc, filter client-side by won_time
+    if (options.filter_by === "won") {
+      params.status = "won";
+      const from = `${options.start_date} 00:00:00`;
+      const to = `${options.end_date} 23:59:59`;
+      return this.fetchDealsByWonDate(params, from, to, maxItems);
+    }
+
+    // filter_by === "created": use /deals with sort=add_time DESC + early exit
     // Pipedrive add_time format: "YYYY-MM-DD HH:MM:SS" (space separator)
     const from = `${options.start_date} 00:00:00`;
     const to = `${options.end_date} 23:59:59`;
-    const deals = await this.fetchDealsByCreatedDate(params, from, to, maxItems);
-    return deals;
+    return this.fetchDealsByCreatedDate(params, from, to, maxItems);
   }
 
   // ── Field definitions ────────────────────────────────────────────────────
@@ -334,6 +342,49 @@ export class PipedriveClient {
     return { items: deals, truncated };
   }
 
+  private async fetchDealsByWonDate(
+    baseParams: Record<string, unknown>,
+    from: string,
+    to: string,
+    maxItems: number
+  ): Promise<PagedResult<Deal>> {
+    const deals: Deal[] = [];
+    let start = 0;
+
+    while (true) {
+      const params: Record<string, unknown> = {
+        ...baseParams,
+        sort: "update_time DESC",
+        start,
+        limit: 500,
+      };
+
+      const res = await this.get<OffsetResponse<Record<string, unknown>>>("/deals", params);
+      const page = res.data ?? [];
+
+      for (const raw of page) {
+        const wonTime = (raw.won_time as string | null) ?? "";
+        if (wonTime && wonTime < from) {
+          // Sorted by update_time desc; won_time may not be monotonic but
+          // once update_time is far before our range we can stop safely
+          const updateTime = (raw.update_time as string) ?? "";
+          if (updateTime < from) return { items: deals, truncated: false };
+          continue;
+        }
+        if (wonTime >= from && wonTime <= to) {
+          deals.push(toDeal(raw));
+          if (deals.length >= maxItems) return { items: deals, truncated: true };
+        }
+      }
+
+      const more = res.additional_data?.pagination?.more_items_in_collection ?? false;
+      if (!more || page.length === 0) break;
+      start += 500;
+    }
+
+    return { items: deals, truncated: false };
+  }
+
   // ── Pagination helpers ───────────────────────────────────────────────────
 
   private async fetchCursor<T>(
@@ -426,6 +477,7 @@ function toDeal(d: Record<string, unknown>): Deal {
     currency: d.currency as string,
     owner_name: (d.owner_name as string | null) ?? null,
     org_name: (d.org_name as string | null) ?? null,
+    won_time: (d.won_time as string | null) ?? null,
   };
 }
 

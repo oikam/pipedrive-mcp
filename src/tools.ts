@@ -43,8 +43,8 @@ export function registerTools(server: McpServer, client: PipedriveClient): void 
         pipeline_id: z.number().int().positive().describe("Pipeline ID"),
         start_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).describe("Start date YYYY-MM-DD (inclusive)"),
         end_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).describe("End date YYYY-MM-DD (inclusive)"),
-        filter_by: z.enum(["created", "updated"]).default("created")
-          .describe("Filter by creation date or last update date"),
+        filter_by: z.enum(["created", "updated", "won"]).default("created")
+          .describe("Filter by: 'created' = creation date, 'updated' = last update date, 'won' = date deal was marked won (ignores status filter, always returns won deals)"),
         status: z.enum(["open", "won", "lost", "all"]).default("all").describe("Deal status filter"),
         limit: z.number().int().min(1).max(2000).default(500)
           .describe("Max deals to return (1-2000). Auto-paginates through all results."),
@@ -64,9 +64,14 @@ export function registerTools(server: McpServer, client: PipedriveClient): void 
           };
         }
 
-        const lines = deals.map((d) =>
-          `• [${d.id}] ${d.title} | ${d.status} | ${d.value != null ? `${d.value} ${d.currency}` : "no value"} | created: ${d.add_time.slice(0, 10)} | updated: ${d.update_time.slice(0, 10)} | owner: ${d.owner_name ?? "—"} | org: ${d.org_name ?? "—"}`
-        );
+        const lines = deals.map((d) => {
+          const dateInfo = filter_by === "won" && d.won_time
+            ? `won: ${d.won_time.slice(0, 10)}`
+            : filter_by === "created"
+            ? `created: ${d.add_time.slice(0, 10)}`
+            : `updated: ${d.update_time.slice(0, 10)}`;
+          return `• [${d.id}] ${d.title} | ${d.status} | ${d.value != null ? `${d.value} ${d.currency}` : "no value"} | ${dateInfo} | owner: ${d.owner_name ?? "—"} | org: ${d.org_name ?? "—"}`;
+        });
 
         const truncatedNote = truncated ? `\n\n⚠️ Results capped at ${limit}. Narrow the date range or increase the limit to get all deals.` : "";
 
