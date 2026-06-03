@@ -16,6 +16,9 @@ if (!mcpAuthToken) {
   process.exit(1);
 }
 
+const oauthClientId = process.env.OAUTH_CLIENT_ID;
+const oauthClientSecret = process.env.OAUTH_CLIENT_SECRET;
+
 const client = new PipedriveClient(apiToken);
 
 function createServer(): McpServer {
@@ -29,6 +32,34 @@ app.use(express.json());
 
 app.get("/health", (_req, res) => {
   res.json({ status: "ok" });
+});
+
+// OAuth 2.0 client credentials endpoint
+// Claude.ai sends client_id + client_secret and expects an access_token back
+app.post("/oauth/token", (req, res) => {
+  const { grant_type, client_id, client_secret } = req.body as Record<string, string>;
+
+  if (grant_type !== "client_credentials") {
+    res.status(400).json({ error: "unsupported_grant_type" });
+    return;
+  }
+
+  if (!oauthClientId || !oauthClientSecret) {
+    res.status(500).json({ error: "OAuth not configured on this server" });
+    return;
+  }
+
+  if (client_id !== oauthClientId || client_secret !== oauthClientSecret) {
+    res.status(401).json({ error: "invalid_client" });
+    return;
+  }
+
+  // Return the MCP bearer token as the access token
+  res.json({
+    access_token: mcpAuthToken,
+    token_type: "bearer",
+    expires_in: 86400,
+  });
 });
 
 app.post("/mcp", async (req, res) => {
