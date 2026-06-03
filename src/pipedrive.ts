@@ -1,5 +1,7 @@
 import axios, { AxiosError, AxiosInstance } from "axios";
 
+const MAX_ITEMS_CAP = 2000;
+
 export interface Pipeline {
   id: number;
   name: string;
@@ -22,26 +24,57 @@ export interface Deal {
   org_name: string | null;
 }
 
-interface PipedriveListResponse<T> {
+export interface FieldOption {
+  id: number;
+  label: string;
+}
+
+export interface PipedriveField {
+  key: string;
+  name: string;
+  field_type: string;
+  mandatory_flag: boolean;
+  options?: FieldOption[];
+}
+
+export interface Organization {
+  id: number;
+  name: string;
+  owner_name: string | null;
+  add_time: string;
+  update_time: string;
+  [key: string]: unknown;
+}
+
+export interface Person {
+  id: number;
+  name: string;
+  email: { value: string; primary: boolean }[];
+  phone: { value: string; primary: boolean }[];
+  org_name: string | null;
+  owner_name: string | null;
+  add_time: string;
+  update_time: string;
+  [key: string]: unknown;
+}
+
+interface CursorResponse<T> {
+  success: boolean;
+  data: T[] | null;
+  additional_data?: { next_cursor?: string | null };
+}
+
+interface OffsetResponse<T> {
   success: boolean;
   data: T[] | null;
   additional_data?: {
-    next_cursor?: string | null;
+    pagination?: { more_items_in_collection: boolean; next_start: number };
   };
 }
 
-interface RawDeal {
-  id: number;
-  title: string;
-  status: string;
-  add_time: string;
-  update_time: string;
-  pipeline_id: number;
-  stage_id: number;
-  value: number | null;
-  currency: string;
-  owner_name?: string | null;
-  org_name?: string | null;
+export interface PagedResult<T> {
+  items: T[];
+  truncated: boolean;
 }
 
 export class PipedriveClient {
@@ -50,82 +83,150 @@ export class PipedriveClient {
   constructor(apiToken: string) {
     this.http = axios.create({
       baseURL: "https://api.pipedrive.com/v1",
-      headers: {
-        "x-api-token": apiToken,
-        "Accept": "application/json",
-      },
+      headers: { "x-api-token": apiToken, Accept: "application/json" },
       timeout: 30000,
     });
   }
 
+  // ── Pipelines ────────────────────────────────────────────────────────────
+
   async listPipelines(): Promise<Pipeline[]> {
-    const results: Pipeline[] = [];
-    let cursor: string | undefined;
-
-    do {
-      const params: Record<string, unknown> = { limit: 500 };
-      if (cursor) params.cursor = cursor;
-
-      const res = await this.get<PipedriveListResponse<Pipeline>>("/pipelines", params);
-      if (res.data) results.push(...res.data);
-      cursor = res.additional_data?.next_cursor ?? undefined;
-    } while (cursor);
-
-    return results;
+    const { items } = await this.fetchCursor<Pipeline>("/pipelines", {}, 500);
+    return items.filter((p) => p.active);
   }
+
+  // ── Deals ────────────────────────────────────────────────────────────────
 
   async getDeals(options: {
     pipeline_id: number;
     start_date: string;
     end_date: string;
+    filter_by: "created" | "updated";
     status?: string;
     limit?: number;
-  }): Promise<Deal[]> {
-    const maxItems = Math.min(options.limit ?? 100, 500);
-    const results: Deal[] = [];
-    let cursor: string | undefined;
-
-    const baseParams: Record<string, unknown> = {
-      pipeline_id: options.pipeline_id,
-      updated_since: `${options.start_date}T00:00:00Z`,
-      updated_until: `${options.end_date}T23:59:59Z`,
-      limit: Math.min(maxItems, 100),
-    };
+  }): Promise<PagedResult<Deal>> {
+    const maxItems = Math.min(options.limit ?? 500, MAX_ITEMS_CAP);
+    const params: Record<string, unknown> = { pipeline_id: options.pipeline_id };
 
     if (options.status && options.status !== "all") {
-      baseParams.status = options.status;
+      params.status = options.status;
     }
 
+    if (options.filter_by === "updated") {
+      params.updated_since = `${options.start_date}T00:00:00Z`;
+      params.updated_until = `${options.end_date}T23:59:59Z`;
+    }
+
+    const { items: raw, truncated } = await this.fetchCursor<Record<string, unknown>>(
+      "/deals/collection",
+      params,
+      options.filter_by === "created" ? MAX_ITEMS_CAP : maxItems
+    );
+
+    let deals = raw.map(toDeal);
+
+    if (options.filter_by === "created") {
+      const from = `${options.start_date}T00:00:00`;
+      const to = `${options.end_date}T23:59:59`;
+      deals = deals.filter((d) => d.add_time >= from && d.add_time <= to);
+    }
+
+    const wasTruncated = truncated || deals.length > maxItems;
+    return { items: deals.slice(0, maxItems), truncated: wasTruncated };
+  }
+
+  // ── Field definitions ────────────────────────────────────────────────────
+
+  async getDealFields(): Promise<PipedriveField[]> {
+    return this.fetchOffset<PipedriveField>("/dealFields");
+  }
+
+  async getOrgFields(): Promise<PipedriveField[]> {
+    return this.fetchOffset<PipedriveField>("/organizationFields");
+  }
+
+  async getPersonFields(): Promise<PipedriveField[]> {
+    return this.fetchOffset<PipedriveField>("/personFields");
+  }
+
+  // ── Organizations ────────────────────────────────────────────────────────
+
+  async listOrganizations(options: {
+    updated_since?: string;
+    updated_until?: string;
+    owner_id?: number;
+    limit?: number;
+  }): Promise<PagedResult<Organization>> {
+    const maxItems = Math.min(options.limit ?? 100, MAX_ITEMS_CAP);
+    const params: Record<string, unknown> = { include_option_labels: true };
+    if (options.updated_since) params.updated_since = options.updated_since;
+    if (options.updated_until) params.updated_until = options.updated_until;
+    if (options.owner_id) params.owner_id = options.owner_id;
+
+    return this.fetchCursor<Organization>("/organizations/collection", params, maxItems);
+  }
+
+  // ── Persons ──────────────────────────────────────────────────────────────
+
+  async listPersons(options: {
+    updated_since?: string;
+    updated_until?: string;
+    org_id?: number;
+    owner_id?: number;
+    limit?: number;
+  }): Promise<PagedResult<Person>> {
+    const maxItems = Math.min(options.limit ?? 100, MAX_ITEMS_CAP);
+    const params: Record<string, unknown> = { include_option_labels: true };
+    if (options.updated_since) params.updated_since = options.updated_since;
+    if (options.updated_until) params.updated_until = options.updated_until;
+    if (options.org_id) params.org_id = options.org_id;
+    if (options.owner_id) params.owner_id = options.owner_id;
+
+    return this.fetchCursor<Person>("/persons/collection", params, maxItems);
+  }
+
+  // ── Pagination helpers ───────────────────────────────────────────────────
+
+  private async fetchCursor<T>(
+    endpoint: string,
+    params: Record<string, unknown>,
+    maxItems: number
+  ): Promise<PagedResult<T>> {
+    const items: T[] = [];
+    let cursor: string | undefined;
+    let truncated = false;
+
     do {
-      const params = { ...baseParams };
-      if (cursor) params.cursor = cursor;
+      const reqParams: Record<string, unknown> = { ...params, limit: Math.min(500, maxItems - items.length) };
+      if (cursor) reqParams.cursor = cursor;
 
-      const res = await this.get<PipedriveListResponse<RawDeal>>("/deals", params);
+      const res = await this.get<CursorResponse<T>>(endpoint, reqParams);
+      if (res.data) items.push(...res.data);
 
-      if (res.data) {
-        for (const d of res.data) {
-          results.push({
-            id: d.id,
-            title: d.title,
-            status: d.status,
-            add_time: d.add_time,
-            update_time: d.update_time,
-            pipeline_id: d.pipeline_id,
-            stage_id: d.stage_id,
-            value: d.value,
-            currency: d.currency,
-            owner_name: d.owner_name ?? null,
-            org_name: d.org_name ?? null,
-          });
-        }
+      cursor = res.additional_data?.next_cursor ?? undefined;
+
+      if (items.length >= maxItems && cursor) {
+        truncated = true;
+        cursor = undefined;
       }
-
-      cursor = results.length < maxItems
-        ? (res.additional_data?.next_cursor ?? undefined)
-        : undefined;
     } while (cursor);
 
-    return results.slice(0, maxItems);
+    return { items, truncated };
+  }
+
+  private async fetchOffset<T>(endpoint: string): Promise<T[]> {
+    const items: T[] = [];
+    let start = 0;
+    let more = true;
+
+    while (more) {
+      const res = await this.get<OffsetResponse<T>>(endpoint, { start, limit: 500 });
+      if (res.data) items.push(...res.data);
+      more = res.additional_data?.pagination?.more_items_in_collection ?? false;
+      start += 500;
+    }
+
+    return items;
   }
 
   private async get<T>(endpoint: string, params?: Record<string, unknown>): Promise<T> {
@@ -138,14 +239,32 @@ export class PipedriveClient {
   }
 }
 
+// ── Mappers ──────────────────────────────────────────────────────────────────
+
+function toDeal(d: Record<string, unknown>): Deal {
+  return {
+    id: d.id as number,
+    title: d.title as string,
+    status: d.status as string,
+    add_time: d.add_time as string,
+    update_time: d.update_time as string,
+    pipeline_id: d.pipeline_id as number,
+    stage_id: d.stage_id as number,
+    value: (d.value as number | null) ?? null,
+    currency: d.currency as string,
+    owner_name: (d.owner_name as string | null) ?? null,
+    org_name: (d.org_name as string | null) ?? null,
+  };
+}
+
 function toPipedriveError(err: unknown): Error {
   if (err instanceof AxiosError && err.response) {
-    const status = err.response.status;
-    if (status === 401) return new Error("Invalid API token. Check your PIPEDRIVE_API_TOKEN.");
-    if (status === 403) return new Error("Access denied. The token lacks permission for this resource.");
-    if (status === 404) return new Error("Resource not found.");
-    if (status === 429) return new Error("Rate limit exceeded. Please wait before retrying.");
-    return new Error(`Pipedrive API error ${status}: ${JSON.stringify(err.response.data)}`);
+    const s = err.response.status;
+    if (s === 401) return new Error("Invalid API token. Check your PIPEDRIVE_API_TOKEN.");
+    if (s === 403) return new Error("Access denied. The token lacks permission for this resource.");
+    if (s === 404) return new Error("Resource not found.");
+    if (s === 429) return new Error("Rate limit exceeded. Please wait before retrying.");
+    return new Error(`Pipedrive API error ${s}: ${JSON.stringify(err.response.data)}`);
   }
   if (err instanceof Error) return err;
   return new Error(String(err));
