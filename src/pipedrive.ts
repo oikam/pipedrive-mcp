@@ -48,6 +48,7 @@ export interface Organization {
   owner_name: string | null;
   add_time: string;
   update_time: string;
+  custom_fields: Record<string, unknown>;
   [key: string]: unknown;
 }
 
@@ -199,13 +200,26 @@ export class PipedriveClient {
 
   // ── Organizations ────────────────────────────────────────────────────────
 
+  async getOrganization(id: number): Promise<Organization> {
+    const res = await this.get<{ success: boolean; data: Record<string, unknown> }>(`/organizations/${id}`);
+    return toOrganization(res.data);
+  }
+
   async listOrganizations(options: {
     updated_since?: string;
     updated_until?: string;
     owner_id?: number;
     limit?: number;
     after_id?: number;
+    ids?: number[];
   }): Promise<PagedResult<Organization>> {
+    // If specific IDs requested, fetch each in parallel (up to 50)
+    if (options.ids && options.ids.length > 0) {
+      const ids = options.ids.slice(0, 50);
+      const results = await Promise.all(ids.map((id) => this.getOrganization(id).catch(() => null)));
+      const items = results.filter((o): o is Organization => o !== null);
+      return { items, truncated: options.ids.length > 50 };
+    }
     const maxItems = Math.min(options.limit ?? 100, MAX_ITEMS_CAP);
 
     // Date filter: /organizations/collection ignores updated_since/until (Pipedrive bug).
@@ -225,7 +239,8 @@ export class PipedriveClient {
     if (options.owner_id) params.owner_id = options.owner_id;
     if (options.after_id) params.since_id = options.after_id;
 
-    return this.fetchCursor<Organization>("/organizations/collection", params, maxItems);
+    const { items: raw, truncated } = await this.fetchCursor<Record<string, unknown>>("/organizations/collection", params, maxItems);
+    return { items: raw.map(toOrganization), truncated };
   }
 
   private async fetchOrgsByUpdatedDate(
@@ -246,14 +261,14 @@ export class PipedriveClient {
       };
       if (owner_id) params.owner_id = owner_id;
 
-      const res = await this.get<OffsetResponse<Organization>>("/organizations", params);
+      const res = await this.get<OffsetResponse<Record<string, unknown>>>("/organizations", params);
       const page = res.data ?? [];
 
-      for (const org of page) {
-        const ut = (org.update_time as string) ?? "";
+      for (const raw of page) {
+        const ut = (raw.update_time as string) ?? "";
         if (ut < from) return { items: orgs, truncated: false };
         if (ut <= to) {
-          orgs.push(org);
+          orgs.push(toOrganization(raw));
           if (orgs.length >= maxItems) return { items: orgs, truncated: true };
         }
       }
@@ -529,6 +544,27 @@ function extractId(v: unknown): number | null {
 }
 
 // ── Mappers ──────────────────────────────────────────────────────────────────
+
+function toOrganization(d: Record<string, unknown>): Organization {
+  const custom_fields: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(d)) {
+    if (CUSTOM_FIELD_KEY.test(k) && v != null) custom_fields[k] = v;
+  }
+  return {
+    id: d.id as number,
+    name: (d.name as string) ?? "",
+    owner_name: extractString(d.owner_name) ?? extractString((d.owner as Record<string, unknown>)?.name),
+    add_time: (d.add_time as string) ?? "",
+    update_time: (d.update_time as string) ?? "",
+    custom_fields,
+    ...d,
+  };
+}
+
+function extractString(v: unknown): string | null {
+  if (typeof v === "string") return v || null;
+  return null;
+}
 
 function toDeal(d: Record<string, unknown>): Deal {
   const custom_fields: Record<string, unknown> = {};

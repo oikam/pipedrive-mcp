@@ -144,6 +144,31 @@ export function registerTools(server: McpServer, client: PipedriveClient): void 
   // ── Organizations ──────────────────────────────────────────────────────────
 
   server.registerTool(
+    "pipedrive_get_organization",
+    {
+      title: "Get Organization by ID",
+      description: "Fetch a single organization by ID including all custom fields (UTMs, etc.). Use after pipedrive_get_deals returns org_id values.",
+      inputSchema: z.object({
+        org_id: z.number().int().positive().describe("Organization ID"),
+      }),
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ org_id }) => {
+      try {
+        const org = await client.getOrganization(org_id);
+        const cf = org.custom_fields as Record<string, unknown>;
+        const cfLines = Object.entries(cf).map(([k, v]) => `  ${k}: ${v}`).join("\n");
+        return {
+          content: [{ type: "text" as const, text: `Organization [${org.id}] ${org.name}\nowner: ${org.owner_name ?? "—"} | updated: ${String(org.update_time).slice(0, 10)}\n\nCustom fields:\n${cfLines || "  (none)"}` }],
+          structuredContent: { organization: org },
+        };
+      } catch (err) {
+        return { content: [{ type: "text" as const, text: `Error: ${errMsg(err)}` }] };
+      }
+    }
+  );
+
+  server.registerTool(
     "pipedrive_list_organizations",
     {
       title: "List Organizations",
@@ -152,23 +177,31 @@ export function registerTools(server: McpServer, client: PipedriveClient): void 
         start_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe("Filter updated since this date (YYYY-MM-DD, inclusive)"),
         end_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe("Filter updated until this date (YYYY-MM-DD, inclusive)"),
         owner_id: z.number().int().positive().optional().describe("Filter by owner user ID"),
+        ids: z.array(z.number().int().positive()).max(50).optional().describe("Fetch specific org IDs (up to 50) — bypasses date filter"),
         limit: z.number().int().min(1).max(5000).default(100).describe("Max organizations to return (auto-paginates up to 5000)"),
         after_id: z.number().int().positive().optional().describe("Return orgs with ID after this value — use for paging beyond the limit"),
       }),
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async ({ start_date, end_date, owner_id, limit, after_id }) => {
+    async ({ start_date, end_date, owner_id, ids, limit, after_id }) => {
       try {
         const { items: orgs, truncated } = await client.listOrganizations({
           updated_since: start_date ? `${start_date}T00:00:00Z` : undefined,
           updated_until: end_date ? `${end_date}T23:59:59Z` : undefined,
           owner_id,
+          ids,
           limit,
           after_id,
         });
 
         const truncatedNote = truncated ? `\n\n⚠️ Results capped at ${limit}.` : "";
-        const text = orgs.map((o) => `• [${o.id}] ${o.name} | owner: ${o.owner_name ?? "—"} | updated: ${String(o.update_time).slice(0, 10)}`).join("\n");
+        const text = orgs.map((o) => {
+          const cf = o.custom_fields as Record<string, unknown>;
+          const cfSummary = Object.keys(cf).length > 0
+            ? ` | custom_fields: ${Object.keys(cf).length} fields`
+            : "";
+          return `• [${o.id}] ${o.name} | owner: ${o.owner_name ?? "—"} | updated: ${String(o.update_time).slice(0, 10)}${cfSummary}`;
+        }).join("\n");
 
         return {
           content: [{ type: "text", text: `Found ${orgs.length} organization(s):\n\n${text}${truncatedNote}` }],
